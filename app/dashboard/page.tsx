@@ -111,6 +111,22 @@ function clientName(r: Row) {
   return `${r.first_name || ""} ${r.last_name || ""}`.trim();
 }
 
+
+function matchesGlobalSearch(r: any, needle: string) {
+  if (!needle) return true;
+  const n = needle.toLowerCase();
+  const full = `${r?.first_name || ""} ${r?.last_name || ""}`.trim();
+  const fields = [
+    r?.client_name,
+    full,
+    r?.first_name,
+    r?.last_name,
+    r?.phone,
+    r?.email,
+  ];
+  return fields.some((v) => String(v ?? "").toLowerCase().includes(n));
+}
+
 function toLocalInput(value: any) {
   if (!value) return "";
   const d = new Date(value);
@@ -225,6 +241,14 @@ export default function Dashboard() {
   const [filterFollowUpStatus, setFilterFollowUpStatus] = useState("");
 
   const [records, setRecords] = useState<Row[]>([]);
+  const [allRows, setAllRows] = useState<Row[]>([]);
+  const [allLoaded, setAllLoaded] = useState(false);
+  const [allFetching, setAllFetching] = useState(false);
+  const allRowsRef = useRef<Row[]>([]);
+
+  useEffect(() => {
+    allRowsRef.current = allRows;
+  }, [allRows]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
   const [pageJump, setPageJump] = useState("1");
@@ -244,7 +268,8 @@ export default function Dashboard() {
           window.location.href = "/";
           return;
         }
-        await Promise.all([fetchTrends(), fetchProgressSummary(), loadPage(0)]);
+        await Promise.all([fetchTrends(), fetchProgressSummary(), fetchAllRecords()]);
+        await loadPage(0);
       } catch (e: any) {
         setError(e?.message || "Failed to initialize");
       } finally {
@@ -258,6 +283,18 @@ export default function Dashboard() {
     loadPage(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sortAll.key, sortAll.dir]);
+
+  useEffect(() => {
+    if (!allLoaded) return;
+    const t = setTimeout(() => {
+      setProgressPage(0);
+      loadPage(0);
+    }, 250);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q, allLoaded]);
+
+
 
   useEffect(() => {
     if (upcoming.length) fetchUpcoming();
@@ -390,21 +427,23 @@ export default function Dashboard() {
     }
   }
 
+  
   async function fetchUpcoming() {
     setUpcomingLoading(true);
     setError(null);
     try {
       const supabase = getSupabase();
-      const start = new Date(rangeStart);
-      const end = new Date(rangeEnd);
-      const startIso = start.toISOString();
-      const endIso = new Date(end.getTime() + 24 * 60 * 60 * 1000).toISOString();
+
+      // Use date-string boundaries (local midnight) to avoid timezone shifts.
+      const startTs = `${rangeStart}T00:00:00`;
+      const endDay = addDays(parseISO(rangeEnd), 1);
+      const endTs = `${format(endDay, "yyyy-MM-dd")}T00:00:00`;
 
       let query = supabase
         .from("client_registrations")
-        .select('id, client_name, "BOP_Date", created_at, "BOP_Status", "Followup_Date", status')
-        .gte("BOP_Date", startIso)
-        .lt("BOP_Date", endIso)
+        .select("*")
+        .gte("BOP_Date", startTs)
+        .lt("BOP_Date", endTs)
         .limit(5000);
 
       query = applySort(query, sortUpcoming);
@@ -420,6 +459,7 @@ export default function Dashboard() {
       setUpcomingLoading(false);
     }
   }
+
 
   async function fetchProgressSummary() {
     setProgressLoading(true);
@@ -460,77 +500,157 @@ export default function Dashboard() {
     }
   }
 
+  
+  async function fetchAllRecords() {
+    if (allLoaded || allFetching) return;
+    setAllFetching(true);
+    setError(null);
+    try {
+      const supabase = getSupabase();
+      const pageSize = 5000;
+      let from = 0;
+      const acc: Row[] = [];
+
+      while (true) {
+        const { data, error } = await supabase
+          .from("client_registrations")
+          .select("*")
+          .order("created_at", { ascending: false })
+          .range(from, from + pageSize - 1);
+
+        if (error) throw error;
+
+        const batch = (data || []) as Row[];
+        acc.push(...batch);
+
+        if (batch.length < pageSize) break;
+
+        from += pageSize;
+        if (from >= 200000) break; // safety cap
+      }
+
+      allRowsRef.current = acc;
+      setAllRows(acc);
+      setAllLoaded(true);
+    } catch (e: any) {
+      setError(e?.message || "Failed to load all records");
+    } finally {
+      setAllFetching(false);
+    }
+  }
+
+
   async function loadPage(nextPage: number) {
     setError(null);
     setLoading(true);
     try {
-      const supabase = getSupabase();
-      const search = q.trim();
-      const fc = filterClient.trim();
-      const fi = filterInterestType.trim();
-      const fb = filterBopStatus.trim();
+      if (!allLoaded && allRowsRef.current.length === 0) {
+        await fetchAllRecords();
+      }
 
-      let countQuery = supabase.from("client_registrations").select("id", { count: "exact", head: true });
-
-      if (search)
-        countQuery = countQuery.or(
-          `first_name.ilike.%${search}%,last_name.ilike.%${search}%,phone.ilike.%${search}%`
-        );
-      if (fc) countQuery = countQuery.or(`first_name.ilike.%${fc}%,last_name.ilike.%${fc}%`);
-      if (fi) countQuery = countQuery.eq("interest_type", fi);
-      if (fb) countQuery = countQuery.eq("BOP_Status", fb);
-
-      const { count, error: cErr } = await countQuery;
-      if (cErr) throw cErr;
-      setTotal(count ?? 0);
-
-      const from = nextPage * ALL_PAGE_SIZE;
-      const to = from + ALL_PAGE_SIZE - 1;
-
-      let dataQuery = supabase.from("client_registrations").select("*").range(from, to);
-
-      if (search)
-        dataQuery = dataQuery.or(
-          `first_name.ilike.%${search}%,last_name.ilike.%${search}%,phone.ilike.%${search}%`
-        );
-      if (fc) dataQuery = dataQuery.or(`first_name.ilike.%${fc}%,last_name.ilike.%${fc}%`);
-      if (fi) dataQuery = dataQuery.eq("interest_type", fi);
-      if (fb) dataQuery = dataQuery.eq("BOP_Status", fb);
-
-      dataQuery = applySort(dataQuery, sortAll);
-
-      const { data, error } = await dataQuery;
-      if (error) throw error;
-
-      const raw = (data || []) as any[];
+      const needle = q.trim().toLowerCase();
+      const fc = filterClient.trim().toLowerCase();
+      const fi = filterInterestType.trim().toLowerCase();
       const fbo = filterBusinessOpp.trim().toLowerCase();
       const fws = filterWealthSolutions.trim().toLowerCase();
+      const fb = filterBopStatus.trim().toLowerCase();
       const ffu = filterFollowUpStatus.trim().toLowerCase();
 
-      const clientSideFiltered = raw.filter((row) => {
-        const opp = Array.isArray(row.business_opportunities)
-          ? row.business_opportunities.join(",")
-          : String(row.business_opportunities || "");
-        const ws = Array.isArray(row.wealth_solutions)
-          ? row.wealth_solutions.join(",")
-          : String(row.wealth_solutions || "");
-        const fu = String(row.FollowUp_Status ?? row.Followup_Status ?? "").toLowerCase();
+      const filtered = (allRowsRef.current || []).filter((row: any) => {
+        if (needle && !matchesGlobalSearch(row, needle)) return false;
 
-        const okOpp = !fbo || opp.toLowerCase().includes(fbo);
-        const okWs = !fws || ws.toLowerCase().includes(fws);
-        const okFu = !ffu || fu.includes(ffu);
-        return okOpp && okWs && okFu;
+        if (fc) {
+          const nm = `${row.first_name || ""} ${row.last_name || ""}`.trim().toLowerCase();
+          if (!nm.includes(fc)) return false;
+        }
+
+        if (fi) {
+          if (String(row.interest_type || "").toLowerCase() !== fi) return false;
+        }
+
+        if (fb) {
+          if (String(row.BOP_Status || "").toLowerCase() !== fb) return false;
+        }
+
+        if (fbo) {
+          const opp = asListItems(row.business_opportunities).join(",").toLowerCase();
+          if (!opp.includes(fbo)) return false;
+        }
+
+        if (fws) {
+          const ws = asListItems(row.wealth_solutions).join(",").toLowerCase();
+          if (!ws.includes(fws)) return false;
+        }
+
+        if (ffu) {
+          const fu = String(row.FollowUp_Status ?? row.Followup_Status ?? "").toLowerCase();
+          if (!fu.includes(ffu)) return false;
+        }
+
+        return true;
       });
 
-      setRecords(clientSideFiltered);
-      setPage(nextPage);
-      setPageJump(String(nextPage + 1));
+      const ascending = sortAll.dir === "asc";
+      const sortKey = sortAll.key;
+
+      const asTime = (v: any) => {
+        if (!v) return Number.NaN;
+        const d = new Date(String(v));
+        const t = d.getTime();
+        return Number.isNaN(t) ? Number.NaN : t;
+      };
+
+      const asText = (v: any) => String(v ?? "").toLowerCase();
+
+      const sorted = [...filtered].sort((a: any, b: any) => {
+        const dir = ascending ? 1 : -1;
+
+        if (sortKey === "client") {
+          return dir * asText(clientName(a)).localeCompare(asText(clientName(b)));
+        }
+
+        const va = a?.[sortKey];
+        const vb = b?.[sortKey];
+
+        const isDateKey =
+          sortKey === "created_at" ||
+          sortKey === "BOP_Date" ||
+          sortKey === "Followup_Date" ||
+          sortKey === "CalledOn" ||
+          sortKey === "Issued";
+
+        if (isDateKey) {
+          const ta = asTime(va);
+          const tb = asTime(vb);
+          if (Number.isNaN(ta) && Number.isNaN(tb)) return 0;
+          if (Number.isNaN(ta)) return 1;
+          if (Number.isNaN(tb)) return -1;
+          return dir * (ta - tb);
+        }
+
+        if (typeof va === "number" && typeof vb === "number") return dir * (va - vb);
+
+        return dir * asText(va).localeCompare(asText(vb));
+      });
+
+      setTotal(sorted.length);
+
+      const totalPagesLocal = Math.max(1, Math.ceil(sorted.length / ALL_PAGE_SIZE));
+      const safePage = Math.min(Math.max(0, nextPage), totalPagesLocal - 1);
+
+      const from = safePage * ALL_PAGE_SIZE;
+      const pageRows = sorted.slice(from, from + ALL_PAGE_SIZE);
+
+      setRecords(pageRows);
+      setPage(safePage);
+      setPageJump(String(safePage + 1));
     } catch (e: any) {
       setError(e?.message || "Failed to load records");
     } finally {
       setLoading(false);
     }
   }
+
 
   async function updateCell(id: string, key: string, rawValue: string) {
     setSavingId(id);
@@ -550,6 +670,7 @@ export default function Dashboard() {
         prev.map((r) => (String(r.id) === String(id) ? { ...r, [key]: payload[key] } : r));
 
       setRecords(patch);
+      setAllRows(patch);
       setUpcoming(patch);
     } catch (e: any) {
       setError(e?.message || "Update failed");
@@ -584,11 +705,11 @@ export default function Dashboard() {
 
   // -------- Progress Summary (filter/sort/paginate client-side) --------
   const progressFilteredSorted = useMemo(() => {
-    const needle = progressFilter.trim().toLowerCase();
+    const needle = q.trim().toLowerCase();
 
-    const filtered = (progressRows || []).filter((r) => {
+    const filtered = (progressRows || []).filter((r: any) => {
       if (!needle) return true;
-      return String(r.client_name || "").toLowerCase().includes(needle);
+      return matchesGlobalSearch(r, needle);
     });
 
     const dirMul = progressSort.dir === "asc" ? 1 : -1;
@@ -618,7 +739,13 @@ export default function Dashboard() {
     });
 
     return filtered;
-  }, [progressRows, progressFilter, progressSort]);
+  }, [progressRows, q, progressSort]);
+
+  const upcomingFiltered = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    if (!needle) return upcoming;
+    return (upcoming || []).filter((r: any) => matchesGlobalSearch(r, needle));
+  }, [upcoming, q]);
 
   const progressTotalPages = Math.max(1, Math.ceil(progressFilteredSorted.length / PROGRESS_PAGE_SIZE));
   const progressPageSafe = Math.min(progressTotalPages - 1, Math.max(0, progressPage));
@@ -658,7 +785,7 @@ export default function Dashboard() {
               <div className="text-xs font-semibold text-slate-600 mb-2">Weekly (Last 5 Weeks)</div>
               <div className="h-64">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={weekly} margin={{ top: 24, right: 16, left: 0, bottom: 0 }}>
+                  <LineChart data={weekly}>
                     <XAxis dataKey="weekEnd" tick={{ fontSize: 11 }} />
                     <YAxis allowDecimals={false} />
                     <Tooltip />
@@ -691,7 +818,7 @@ export default function Dashboard() {
               <div className="text-xs font-semibold text-slate-600 mb-2">Monthly (Current Year)</div>
               <div className="h-64">
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={monthly} margin={{ top: 24, right: 16, left: 0, bottom: 0 }}>
+                  <BarChart data={monthly}>
                     <XAxis dataKey="month" tick={{ fontSize: 11 }} />
                     <YAxis allowDecimals={false} />
                     <Tooltip />
@@ -745,7 +872,7 @@ export default function Dashboard() {
             <Button
               variant="secondary"
               onClick={() => setUpcomingVisible((v) => !v)}
-              disabled={!upcoming.length && !upcomingVisible}
+              disabled={upcomingLoading}
             >
               {upcomingVisible ? "Hide Upcoming Table" : "Show Upcoming Table"}
             </Button>
@@ -756,7 +883,7 @@ export default function Dashboard() {
         </Card>
 
         {/* Upcoming Table */}
-        {upcomingVisible && upcoming.length > 0 && (
+        {upcomingVisible && upcomingFiltered.length > 0 && (
           <Card title="Upcoming BOP Meetings (Editable)">
             <div className="flex items-center justify-between mb-2">
               <div className="text-sm text-slate-600">Table supports vertical + horizontal scrolling.</div>
@@ -764,7 +891,7 @@ export default function Dashboard() {
             </div>
 
             <ExcelTableEditable
-              rows={upcoming}
+              rows={upcomingFiltered}
               savingId={savingId}
               onUpdate={updateCell}
               preferredOrder={["BOP_Date", "created_at", "BOP_Status", "Followup_Date", "status"]}
@@ -856,62 +983,7 @@ export default function Dashboard() {
           </div>
         </Card>
 
-        {/* Client Progress Summary */}
-        <Card title="Client Progress Summary">
-          <div className="flex flex-col md:flex-row md:items-center gap-2 mb-2">
-            <input
-              className="w-full border border-slate-300 px-4 py-3"
-              placeholder="Filter by client name..."
-              value={progressFilter}
-              onChange={(e) => {
-                setProgressFilter(e.target.value);
-                setProgressPage(0);
-              }}
-            />
-            <Button variant="secondary" onClick={fetchProgressSummary} disabled={progressLoading}>
-              {progressLoading ? "Loading…" : "Refresh"}
-            </Button>
-            <Button variant="secondary" onClick={() => setProgressVisible((v) => !v)}>
-              {progressVisible ? "Hide Table" : "Show Table"}
-            </Button>
-
-            <div className="md:ml-auto flex items-center gap-2">
-              <Button
-                variant="secondary"
-                onClick={() => setProgressPage((p) => Math.max(0, p - 1))}
-                disabled={!progressVisible || progressPageSafe <= 0}
-              >
-                Previous
-              </Button>
-              <Button
-                variant="secondary"
-                onClick={() => setProgressPage((p) => Math.min(progressTotalPages - 1, p + 1))}
-                disabled={!progressVisible || progressPageSafe >= progressTotalPages - 1}
-              >
-                Next
-              </Button>
-            </div>
-          </div>
-
-          <div className="text-xs text-slate-600 mb-2">Click headers to sort.</div>
-
-          {progressVisible && (
-            <ProgressSummaryTable
-              rows={progressSlice}
-              sortState={progressSort}
-              onSortChange={(k) => setProgressSort((cur) => toggleProgressSort(cur, k))}
-            />
-          )}
-
-          {progressVisible && (
-            <div className="mt-2 text-xs text-slate-600">
-              Page <b>{progressPageSafe + 1}</b> of <b>{progressTotalPages}</b> • showing {PROGRESS_PAGE_SIZE} per page
-            </div>
-          )}
-        </Card>
-      
-
-      {/* All Records */}
+        {/* All Records */}
         <Card title="All Records (Editable)">
           <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 mb-2">
             <div className="text-sm text-slate-600">
@@ -920,6 +992,15 @@ export default function Dashboard() {
 
             <div className="flex flex-wrap items-center gap-2">
               {sortHelp}
+              <div className="flex items-center gap-2 border border-slate-300 px-3 py-2 bg-white">
+                <span className="text-xs font-semibold text-slate-600">Search</span>
+                <input
+                  className="w-56 border border-slate-300 px-2 py-1 text-sm"
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                  placeholder="Name / phone / email"
+                />
+              </div>
               <div className="flex items-center gap-2 border border-slate-300 px-3 py-2 bg-white">
                 <span className="text-xs font-semibold text-slate-600">Go to page</span>
                 <input
@@ -968,7 +1049,60 @@ export default function Dashboard() {
           )}
         </Card>
 
-        </div>
+        {/* Client Progress Summary */}
+        <Card title="Client Progress Summary">
+          <div className="flex flex-col md:flex-row md:items-center gap-2 mb-2">
+            <input
+              className="w-full border border-slate-300 px-4 py-3"
+              placeholder="Filter by client name..."
+              value={q}
+              onChange={(e) => {
+                setQ(e.target.value);
+                setProgressPage(0);
+              }}
+            />
+            <Button variant="secondary" onClick={fetchProgressSummary} disabled={progressLoading}>
+              {progressLoading ? "Loading…" : "Refresh"}
+            </Button>
+            <Button variant="secondary" onClick={() => setProgressVisible((v) => !v)}>
+              {progressVisible ? "Hide Table" : "Show Table"}
+            </Button>
+
+            <div className="md:ml-auto flex items-center gap-2">
+              <Button
+                variant="secondary"
+                onClick={() => setProgressPage((p) => Math.max(0, p - 1))}
+                disabled={!progressVisible || progressPageSafe <= 0}
+              >
+                Previous
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={() => setProgressPage((p) => Math.min(progressTotalPages - 1, p + 1))}
+                disabled={!progressVisible || progressPageSafe >= progressTotalPages - 1}
+              >
+                Next
+              </Button>
+            </div>
+          </div>
+
+          <div className="text-xs text-slate-600 mb-2">Click headers to sort.</div>
+
+          {progressVisible && (
+            <ProgressSummaryTable
+              rows={progressSlice}
+              sortState={progressSort}
+              onSortChange={(k) => setProgressSort((cur) => toggleProgressSort(cur, k))}
+            />
+          )}
+
+          {progressVisible && (
+            <div className="mt-2 text-xs text-slate-600">
+              Page <b>{progressPageSafe + 1}</b> of <b>{progressTotalPages}</b> • showing {PROGRESS_PAGE_SIZE} per page
+            </div>
+          )}
+        </Card>
+      </div>
     </div>
   );
 }
